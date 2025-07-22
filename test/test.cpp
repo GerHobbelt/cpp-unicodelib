@@ -1,4 +1,4 @@
-﻿#include <unicodelib.h>
+#include <unicodelib.h>
 #include <unicodelib_encodings.h>
 
 #include <catch2/catch_test_macros.hpp>
@@ -437,13 +437,13 @@ TEST_CASE("Normalization", "[normalization]") {
 
 namespace test_utf8 {
 
-std::string u8text = u8"日本語もOKです。";
+std::string u8text = (const char *)u8"日本語もOKです。";
 std::u32string u32text = U"日本語もOKです。";
 
-std::string str1(u8"a");
-std::string str2(u8"À");
-std::string str3(u8"あ");
-std::string str4(u8"𠀋");
+std::string str1((const char *)u8"a");
+std::string str2((const char *)u8"À");
+std::string str3((const char *)u8"あ");
+std::string str4((const char *)u8"𠀋");
 
 TEST_CASE("codepoint length in char32_t", "[utf8]") {
   REQUIRE(utf8::codepoint_length(U'a') == 1);
@@ -458,20 +458,20 @@ TEST_CASE("encode 1", "[utf8]") {
   REQUIRE(utf8::encode_codepoint(U'À', out2) == 2);
   REQUIRE(utf8::encode_codepoint(U'あ', out3) == 3);
   REQUIRE(utf8::encode_codepoint(U'𠀋', out4) == 4);
-  REQUIRE(out1 == u8"a");
-  REQUIRE(out2 == u8"À");
-  REQUIRE(out3 == u8"あ");
-  REQUIRE(out4 == u8"𠀋");
+  REQUIRE(out1 == (const char *)u8"a");
+  REQUIRE(out2 == (const char *)u8"À");
+  REQUIRE(out3 == (const char *)u8"あ");
+  REQUIRE(out4 == (const char *)u8"𠀋");
 }
 
 TEST_CASE("encode 2", "[utf8]") {
   std::string out;
   utf8::encode(u32text, out);
-  REQUIRE(out == u8"日本語もOKです。");
+  REQUIRE(out == (const char *)u8"日本語もOKです。");
 }
 
 TEST_CASE("encode 3", "[utf8]") {
-  REQUIRE(utf8::encode(u32text) == u8"日本語もOKです。");
+  REQUIRE(utf8::encode(u32text) == (const char *)u8"日本語もOKです。");
 }
 
 TEST_CASE("codepoint length in utf8", "[utf8]") {
@@ -606,7 +606,7 @@ TEST_CASE("utf16 decode 3", "[utf16]") {
 namespace test_encodeings {
 
 TEST_CASE("Conversion text", "[encodings]") {
-  std::string u8text = u8"日本語もOKです。";
+  std::string u8text = (const char *)u8"日本語もOKです。";
   std::u16string u16text = u"日本語もOKです。";
   std::u32string u32text = U"日本語もOKです。";
   std::wstring wtext = L"日本語もOKです。";
