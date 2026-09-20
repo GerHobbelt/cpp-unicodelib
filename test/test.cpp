@@ -2,6 +2,8 @@
 #include <unicodelib_encodings.h>
 
 #include <catch2/catch_test_macros.hpp>
+#include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -486,6 +488,23 @@ TEST_CASE("Grapheme cluster segmentation", "[segmentation]") {
       });
 }
 
+// The boundaries a *_length walk lands on, as the same position-indexed
+// vector the test files describe, so a walk can be checked against them.
+template <typename Length>
+std::vector<bool> walk_boundaries(const std::u32string &s32, Length length) {
+  std::vector<bool> boundary(s32.size() + 1, false);
+  size_t i = 0;
+  boundary[i] = true;
+  while (i < s32.size()) {
+    auto len = length(s32.data() + i, s32.size() - i);
+    REQUIRE(len > 0);
+    REQUIRE(i + len <= s32.size());
+    i += len;
+    boundary[i] = true;
+  }
+  return boundary;
+}
+
 TEST_CASE("Word segmentation", "[segmentation]") {
   auto path = "../UCD/auxiliary/WordBreakTest.txt";
   read_text_segmentation_test_file(
@@ -495,6 +514,10 @@ TEST_CASE("Word segmentation", "[segmentation]") {
           auto actual = is_word_boundary(s32.data(), s32.length(), i);
           CHECK(boundary[i] == actual);
         }
+
+        auto walked = walk_boundaries(
+            s32, [](auto *s, auto l) { return word_length(s, l); });
+        CHECK(boundary == walked);
       });
 }
 
@@ -507,7 +530,33 @@ TEST_CASE("Sentence segmentation", "[segmentation]") {
           auto actual = is_sentence_boundary(s32.data(), s32.length(), i);
           CHECK(boundary[i] == actual);
         }
+
+        auto walked = walk_boundaries(
+            s32, [](auto *s, auto l) { return sentence_length(s, l); });
+        CHECK(boundary == walked);
       });
+}
+
+// The linear shape segment_length's comment promises: 400,000 scalars of
+// flags walk in a few milliseconds, where asking is_word_boundary about every
+// position takes minutes.
+TEST_CASE("Word segmentation is linear over a run of flags",
+          "[segmentation]") {
+  const size_t flags = 200000;
+  std::u32string s32;
+  s32.reserve(flags * 2);
+  for (size_t i = 0; i < flags; i++) {
+    s32 += U"\U0001F1FA\U0001F1F8";  // U+1F1FA U+1F1F8: the flag of the US
+  }
+
+  auto start = std::chrono::steady_clock::now();
+  auto boundary = walk_boundaries(
+      s32, [](auto *s, auto l) { return word_length(s, l); });
+  auto elapsed = std::chrono::steady_clock::now() - start;
+
+  // One boundary per flag, plus the start of the text.
+  CHECK(std::count(boundary.begin(), boundary.end(), true) == flags + 1);
+  CHECK(std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() < 2);
 }
 
 //-----------------------------------------------------------------------------
