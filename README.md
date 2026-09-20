@@ -10,6 +10,12 @@ API
 
 ## Functions
 
+### Unicode Scalar Value
+
+```cpp
+bool is_scalar_value(char32_t cp); // false for surrogates and code points beyond U+10FFFF
+```
+
 ### Unicode Property
 
 #### General Category
@@ -107,19 +113,58 @@ char32_t simple_lowercase_mapping(char32_t cp);
 char32_t simple_titlecase_mapping(char32_t cp);
 char32_t simple_case_folding(char32_t cp);
 
-std::u32string to_uppercase(const char32_t *s32, size_t l, const char *lang = nullptr);
-std::u32string to_lowercase(const char32_t *s32, size_t l, const char *lang = nullptr);
-std::u32string to_titlecase(const char32_t *s32, size_t l, const char *lang = nullptr);
-std::u32string to_case_fold(const char32_t *s32, size_t l, bool special_case_for_uppercase_I_and_dotted_uppercase_I = false);
+std::u32string to_uppercase(const char32_t *s32, size_t l, const CaseOptions &options = {});
+std::u32string to_lowercase(const char32_t *s32, size_t l, const CaseOptions &options = {});
+std::u32string to_titlecase(const char32_t *s32, size_t l, const CaseOptions &options = {});
+std::u32string to_case_fold(const char32_t *s32, size_t l, const CaseOptions &options = {});
 
 bool is_uppercase(const char32_t *s32, size_t l);
 bool is_lowercase(const char32_t *s32, size_t l);
 bool is_titlecase(const char32_t *s32, size_t l);
 bool is_case_fold(const char32_t *s32, size_t l);
 
-bool caseless_match(const char32_t *s1, size_t l1, const char32_t *s2, size_t l2, bool special_case_for_uppercase_I_and_dotted_uppercase_I = false);
-bool canonical_caseless_match(const char32_t *s1, size_t l1, const char32_t *s2, size_t l2, bool special_case_for_uppercase_I_and_dotted_uppercase_I = false);
-bool compatibility_caseless_match(const char32_t *s1, size_t l1, const char32_t *s2, size_t l2, bool special_case_for_uppercase_I_and_dotted_uppercase_I = false);
+bool caseless_match(const char32_t *s1, size_t l1, const char32_t *s2, size_t l2, const CaseOptions &options = {});
+bool canonical_caseless_match(const char32_t *s1, size_t l1, const char32_t *s2, size_t l2, const CaseOptions &options = {});
+bool compatibility_caseless_match(const char32_t *s1, size_t l1, const char32_t *s2, size_t l2, const CaseOptions &options = {});
+```
+
+#### Locale and tailorings
+
+The case operations take a `CaseOptions` value that bundles a locale and a set of
+opt-in tailorings. It is implicitly constructible from a locale tag, a `Locale`,
+or a `CaseTailoring`, so most call sites stay terse:
+
+```cpp
+struct CaseOptions {
+  Locale locale;
+  CaseTailoring tailoring = CaseTailoring::None;
+};
+
+enum class CaseTailoring : unsigned {
+  None = 0,
+  TurkicCaseFold = 1u << 0,       // optional "T" mappings in CaseFolding.txt
+  GermanCapitalSharpS = 1u << 1,  // uppercase ß (U+00DF) as ẞ (U+1E9E)
+};
+```
+
+`Locale` is matched by its primary language subtag, case-insensitively, so
+`"tr"`, `"tr-TR"`, `"TR"` and `"tr_TR"` are all treated as Turkish. The locale
+drives the language-sensitive mappings — Turkish/Azeri/Lithuanian (from
+`SpecialCasing.txt`) and the Dutch `IJ` titlecasing tailoring:
+
+```cpp
+to_titlecase(U"ijsje", "nl");          // "IJsje"
+to_titlecase(U"ijsje", "nl-BE");       // "IJsje"
+```
+
+`CaseTailoring` holds opt-in behaviors that are *not* implied by the locale.
+Flags combine with `operator|`, and a locale can be combined with flags too:
+
+```cpp
+to_uppercase(U"Maße");                                       // "MASSE" (default)
+to_uppercase(U"Maße", CaseTailoring::GermanCapitalSharpS);   // "MAẞE"
+to_uppercase(U"Straße", Locale{"de"} | CaseTailoring::GermanCapitalSharpS);
+to_case_fold(U"İ", CaseTailoring::TurkicCaseFold);
 ```
 
 ### Code Block
@@ -168,6 +213,27 @@ size_t grapheme_count(const char32_t* s32, size_t l);
 bool is_word_boundary(const char32_t *s32, size_t l, size_t i);
 
 bool is_sentence_boundary(const char32_t *s32, size_t l, size_t i);
+```
+
+### East Asian Width / Display Width
+
+```cpp
+// East_Asian_Width property (UAX #11)
+enum class EastAsianWidth { Neutral, Ambiguous, Halfwidth, Wide, Fullwidth, Narrow };
+EastAsianWidth east_asian_width(char32_t cp);
+
+// How Ambiguous-width characters are counted as terminal columns
+enum class AmbiguousWidth { Narrow, Wide };
+
+// Display width (terminal columns) of a single code point: 0 / 1 / 2
+int codepoint_width(char32_t cp, AmbiguousWidth amb = AmbiguousWidth::Narrow);
+
+// Display width of a string, measured per extended grapheme cluster so that
+// emoji ZWJ sequences, flags, keycaps and base+variation-selector sequences
+// each count as one cell group.
+int width(const char32_t* s32, size_t l, AmbiguousWidth amb = AmbiguousWidth::Narrow);
+int width(const char32_t* s32, AmbiguousWidth amb = AmbiguousWidth::Narrow);
+int width(std::u32string_view s32, AmbiguousWidth amb = AmbiguousWidth::Narrow);
 ```
 
 ### Encoding

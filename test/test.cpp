@@ -27,6 +27,30 @@ void split(const char *b, const char *e, char d, Fn fn) {
 }
 
 //-----------------------------------------------------------------------------
+// Unicode Scalar Value
+//-----------------------------------------------------------------------------
+
+TEST_CASE("is_scalar_value", "[scalar value]") {
+  REQUIRE(is_scalar_value(U'a') == true);
+  REQUIRE(is_scalar_value(0xD7FF) == true);
+  REQUIRE(is_scalar_value(0xD800) == false);  // Surrogate
+  REQUIRE(is_scalar_value(0xDFFF) == false);  // Surrogate
+  REQUIRE(is_scalar_value(0xE000) == true);
+  REQUIRE(is_scalar_value(0x10FFFF) == true);
+  REQUIRE(is_scalar_value(0x110000) == false);  // Beyond U+10FFFF
+}
+
+TEST_CASE("Property lookup beyond U+10FFFF", "[scalar value]") {
+  REQUIRE(general_category(0x110000) == GeneralCategory::Unassigned);
+  REQUIRE(general_category(0xFFFFFFFF) == GeneralCategory::Unassigned);
+  REQUIRE(is_letter(0x110000) == false);
+  REQUIRE(is_white_space(0xFFFFFFFF) == false);
+  REQUIRE(is_alphabetic(0x110000) == false);
+  REQUIRE(block(0x110000) == Block::Unassigned);
+  REQUIRE(script(0x110000) == Script::Unassigned);
+}
+
+//-----------------------------------------------------------------------------
 // General Category
 //-----------------------------------------------------------------------------
 
@@ -167,8 +191,20 @@ TEST_CASE("Full case mapping", "[case]") {
   REQUIRE(to_uppercase(U"χαοσς") == U"ΧΑΟΣΣ");
   REQUIRE(to_uppercase(U"χαος σ") == U"ΧΑΟΣ Σ");
 
-  // German
+  // German: by default, ß (U+00DF) uppercases to "SS"
   REQUIRE(to_uppercase(U"Maße") == U"MASSE");
+
+  // German capital sharp s tailoring (opt-in): ß -> ẞ (U+1E9E)
+  REQUIRE(to_uppercase(U"Maße", CaseTailoring::GermanCapitalSharpS) ==
+          U"MAẞE");
+  REQUIRE(to_uppercase(U"straße", CaseTailoring::GermanCapitalSharpS) ==
+          U"STRAẞE");
+  REQUIRE(to_uppercase(U"ß", CaseTailoring::GermanCapitalSharpS) == U"ẞ");
+  // It can be combined with a locale and does not affect lowercasing.
+  REQUIRE(to_uppercase(U"Maße",
+                       Locale{"de"} | CaseTailoring::GermanCapitalSharpS) ==
+          U"MAẞE");
+  REQUIRE(to_lowercase(U"ẞ", CaseTailoring::GermanCapitalSharpS) == U"ß");
 
   // Title case
   REQUIRE(to_titlecase(U"hello WORLD. A, a.") == U"Hello World. A, A.");
@@ -181,6 +217,11 @@ TEST_CASE("Full case mapping", "[case]") {
   REQUIRE(to_titlecase(U"ik hou van ijsje", "nl") == U"Ik Hou Van IJsje");
   REQUIRE(to_titlecase(U"ijmuiden", "nl") == U"IJmuiden");
   REQUIRE(to_titlecase(U"IJMUIDEN", "nl") == U"IJmuiden");
+  // The locale is matched by its primary subtag, case-insensitively.
+  REQUIRE(to_titlecase(U"ijsje", "nl-BE") == U"IJsje");
+  REQUIRE(to_titlecase(U"ijsje", "nl_NL") == U"IJsje");
+  REQUIRE(to_titlecase(U"ijsje", "NL") == U"IJsje");
+  REQUIRE(to_titlecase(U"ijsje", Locale{"nl-NL"}) == U"IJsje");
   // Without Dutch locale, IJ should not be special-cased
   REQUIRE(to_titlecase(U"ijsje") == U"Ijsje");
   REQUIRE(to_titlecase(U"ijsje", "en") == U"Ijsje");
@@ -203,11 +244,16 @@ TEST_CASE("Casless match", "[case]") {
   REQUIRE(caseless_match(U"İstanbul", U"ıstanbul") == false);
   REQUIRE(caseless_match(U"İstanbul", U"Istanbul") == false);
   REQUIRE(caseless_match(U"Istanbul", U"istanbul") == true);
-  REQUIRE(caseless_match(U"Istanbul", U"ıstanbul", true) == true);
-  REQUIRE(caseless_match(U"İstanbul", U"istanbul", true) == true);
-  REQUIRE(caseless_match(U"İstanbul", U"ıstanbul", true) == false);
-  REQUIRE(caseless_match(U"İstanbul", U"Istanbul", true) == false);
-  REQUIRE(caseless_match(U"Istanbul", U"istanbul", true) == false);
+  REQUIRE(caseless_match(U"Istanbul", U"ıstanbul",
+                         CaseTailoring::TurkicCaseFold) == true);
+  REQUIRE(caseless_match(U"İstanbul", U"istanbul",
+                         CaseTailoring::TurkicCaseFold) == true);
+  REQUIRE(caseless_match(U"İstanbul", U"ıstanbul",
+                         CaseTailoring::TurkicCaseFold) == false);
+  REQUIRE(caseless_match(U"İstanbul", U"Istanbul",
+                         CaseTailoring::TurkicCaseFold) == false);
+  REQUIRE(caseless_match(U"Istanbul", U"istanbul",
+                         CaseTailoring::TurkicCaseFold) == false);
 
   // Sigma
   REQUIRE(caseless_match(U"όσος", U"ΌΣΟΣ") == true);
@@ -529,6 +575,71 @@ TEST_CASE("decode 3", "[utf8]") {
   REQUIRE(utf8::decode(u8text) == u32text);
 }
 
+TEST_CASE("decode invalid utf8 resync", "[utf8]") {
+  // An invalid lead byte must resync at the next byte and must not swallow the
+  // following valid characters.
+  REQUIRE(utf8::decode("\xE0" "AB") == U"AB");        // truncated 3-byte lead
+  REQUIRE(utf8::decode("\xF0" "Hello") == U"Hello");  // truncated 4-byte lead
+  REQUIRE(utf8::decode("\xE1\x80" "A") == U"A");       // bad 3rd byte
+  REQUIRE(utf8::decode("a\x80" "b") == U"ab");         // lone continuation byte
+  REQUIRE(utf8::decode("\xFF\xFF" "x") == U"x");        // never-valid lead bytes
+}
+
+TEST_CASE("decode_codepoint rejects bad continuation bytes", "[utf8]") {
+  char32_t cp;
+  // A continuation byte that is not 0x80-0xBF makes decode fail (0 bytes).
+  REQUIRE(utf8::decode_codepoint("\xE0" "AB", 3, cp) == 0);
+  REQUIRE(utf8::decode_codepoint("\xF0\x41\x42\x43", 4, cp) == 0);
+  // A well-formed sequence is still accepted and reports its length.
+  REQUIRE(utf8::decode_codepoint(u8"あ", 3, cp) == 3);
+}
+
+TEST_CASE("decode_codepoint rejects ill-formed scalar values", "[utf8]") {
+  char32_t cp;
+  // Overlong sequences
+  REQUIRE(utf8::decode_codepoint("\xC0\xAF", 2, cp) == 0);
+  REQUIRE(utf8::decode_codepoint("\xC1\xBF", 2, cp) == 0);
+  REQUIRE(utf8::decode_codepoint("\xE0\x80\xAF", 3, cp) == 0);
+  REQUIRE(utf8::decode_codepoint("\xF0\x80\x80\xAF", 4, cp) == 0);
+  // Surrogates
+  REQUIRE(utf8::decode_codepoint("\xED\xA0\x80", 3, cp) == 0);  // U+D800
+  REQUIRE(utf8::decode_codepoint("\xED\xBF\xBF", 3, cp) == 0);  // U+DFFF
+  // Beyond U+10FFFF
+  REQUIRE(utf8::decode_codepoint("\xF4\x90\x80\x80", 4, cp) == 0);  // U+110000
+  REQUIRE(utf8::decode_codepoint("\xF5\x80\x80\x80", 4, cp) == 0);
+
+  // Boundaries that must stay valid
+  REQUIRE(utf8::decode_codepoint("\xC2\x80", 2, cp) == 2);
+  REQUIRE(cp == 0x0080);
+  REQUIRE(utf8::decode_codepoint("\xE0\xA0\x80", 3, cp) == 3);
+  REQUIRE(cp == 0x0800);
+  REQUIRE(utf8::decode_codepoint("\xED\x9F\xBF", 3, cp) == 3);
+  REQUIRE(cp == 0xD7FF);
+  REQUIRE(utf8::decode_codepoint("\xEE\x80\x80", 3, cp) == 3);
+  REQUIRE(cp == 0xE000);
+  REQUIRE(utf8::decode_codepoint("\xF4\x8F\xBF\xBF", 4, cp) == 4);
+  REQUIRE(cp == 0x10FFFF);
+}
+
+TEST_CASE("decode drops ill-formed sequences and resyncs", "[utf8]") {
+  REQUIRE(utf8::decode("\xC0\xAF" "A") == U"A");          // overlong '/'
+  REQUIRE(utf8::decode("\xED\xA0\x80" "A") == U"A");      // surrogate U+D800
+  REQUIRE(utf8::decode("\xF4\x90\x80\x80" "A") == U"A");  // U+110000
+}
+
+TEST_CASE("codepoint_length consistent with decode_codepoint", "[utf8]") {
+  REQUIRE(utf8::codepoint_length("\xE3\x81", 2) == 0);      // truncated
+  REQUIRE(utf8::codepoint_length("\x80", 1) == 0);          // continuation byte
+  REQUIRE(utf8::codepoint_length("\xED\xA0\x80", 3) == 0);  // surrogate
+  REQUIRE(utf8::codepoint_length("\xE3\x81\x82", 3) == 3);
+}
+
+TEST_CASE("codepoint_count with ill-formed input", "[utf8]") {
+  // never loops forever, and matches what decode() produces
+  REQUIRE(utf8::codepoint_count("a\x80" "b", 3) == 2);
+  REQUIRE(utf8::codepoint_count("\xF0" "Hello", 6) == 5);
+}
+
 }  // namespace test_utf8
 
 //-----------------------------------------------------------------------------
@@ -613,6 +724,48 @@ TEST_CASE("utf16 decode 3", "[utf16]") {
   REQUIRE(utf16::decode(u16text) == u32text);
 }
 
+TEST_CASE("utf16 decode invalid resync", "[utf16]") {
+  // A lone high surrogate must resync and must not swallow the next unit.
+  const char16_t lone_high[] = {0xD800, u'A'};
+  REQUIRE(utf16::decode(std::u16string_view(lone_high, 2)) == U"A");
+}
+
+TEST_CASE("utf16 is_surrogate_pair bounds", "[utf16]") {
+  // Must not read s16[1] when only one unit is available.
+  const char16_t lone_high[] = {0xD800};
+  REQUIRE(utf16::is_surrogate_pair(lone_high, 1) == false);
+}
+
+TEST_CASE("utf16 decode_codepoint rejects unpaired surrogates", "[utf16]") {
+  char32_t cp;
+  const char16_t high[] = {0xD800, u'A'};
+  const char16_t low[] = {0xDC00, u'A'};
+  REQUIRE(utf16::decode_codepoint(high, 2, cp) == 0);
+  REQUIRE(utf16::decode_codepoint(low, 2, cp) == 0);
+}
+
+TEST_CASE("utf16 decode drops unpaired surrogates", "[utf16]") {
+  const char16_t s[] = {0xDC00, u'A'};
+  REQUIRE(utf16::decode(s, 2) == U"A");
+}
+
+TEST_CASE("utf16 codepoint_length consistent with encode/decode", "[utf16]") {
+  // Invalid scalar values yield 0, as encode_codepoint does.
+  REQUIRE(utf16::codepoint_length(0xD800) == 0);
+  REQUIRE(utf16::codepoint_length(0x110000) == 0);
+  REQUIRE(utf16::codepoint_length(0x10FFFF) == 2);
+  // Unpaired surrogates yield 0, as decode_codepoint does.
+  const char16_t high[] = {0xD800};
+  const char16_t low[] = {0xDC00};
+  REQUIRE(utf16::codepoint_length(high, 1) == 0);
+  REQUIRE(utf16::codepoint_length(low, 1) == 0);
+}
+
+TEST_CASE("utf16 codepoint_count with unpaired surrogates", "[utf16]") {
+  const char16_t s[] = {0xD800, u'A', 0xDC00, u'B'};
+  REQUIRE(utf16::codepoint_count(s, 4) == 2);
+}
+
 }  // namespace test_utf16
 
 //-----------------------------------------------------------------------------
@@ -639,5 +792,112 @@ TEST_CASE("Conversion text", "[encodings]") {
 }
 
 }  // namespace test_encodeings
+
+//-----------------------------------------------------------------------------
+// East Asian Width / Display Width
+//-----------------------------------------------------------------------------
+
+TEST_CASE("east_asian_width property", "[width]") {
+  REQUIRE(east_asian_width(U'A') == EastAsianWidth::Narrow);       // Na
+  REQUIRE(east_asian_width(U' ') == EastAsianWidth::Narrow);       // Na
+  REQUIRE(east_asian_width(0x00A1) == EastAsianWidth::Ambiguous);  // ¡ -> A
+  REQUIRE(east_asian_width(0x3042) == EastAsianWidth::Wide);       // ぁ -> W
+  REQUIRE(east_asian_width(0xFF21) == EastAsianWidth::Fullwidth);  // Ａ -> F
+  REQUIRE(east_asian_width(0xFF61) == EastAsianWidth::Halfwidth);  // ｡ -> H
+
+  // Unassigned code points in the CJK / SIP / TIP ranges default to Wide.
+  REQUIRE(east_asian_width(0x4E00) == EastAsianWidth::Wide);   // assigned CJK
+  REQUIRE(east_asian_width(0x20000) == EastAsianWidth::Wide);  // SIP
+  REQUIRE(east_asian_width(0x3FFFD) == EastAsianWidth::Wide);  // TIP boundary
+}
+
+TEST_CASE("codepoint_width", "[width]") {
+  REQUIRE(codepoint_width(U'A') == 1);
+  REQUIRE(codepoint_width(0x3042) == 2);  // ぁ (Wide)
+  REQUIRE(codepoint_width(0xFF21) == 2);  // Ａ (Fullwidth)
+  REQUIRE(codepoint_width(0xFF61) == 1);  // ｡ (Halfwidth)
+
+  REQUIRE(codepoint_width(U'\0') == 0);    // NUL
+  REQUIRE(codepoint_width(U'\t') == 0);    // control
+  REQUIRE(codepoint_width(0x0301) == 0);   // combining acute (Mn)
+  REQUIRE(codepoint_width(0x200D) == 0);   // ZWJ (Cf)
+  REQUIRE(codepoint_width(0x20DD) == 0);   // enclosing circle (Me)
+  REQUIRE(codepoint_width(0x1F600) == 2);  // GRINNING FACE (Emoji_Presentation)
+
+  // Ambiguous width follows the policy.
+  REQUIRE(codepoint_width(0x00A1, AmbiguousWidth::Narrow) == 1);
+  REQUIRE(codepoint_width(0x00A1, AmbiguousWidth::Wide) == 2);
+}
+
+TEST_CASE("width of strings", "[width]") {
+  REQUIRE(width(U"hello") == 5);
+  REQUIRE(width(U"日本語") == 6);
+  REQUIRE(width(U"aあb") == 4);
+
+  // A combining mark adds no width: 'e' + U+0301 (COMBINING ACUTE ACCENT).
+  REQUIRE(width(U"é") == 1);
+
+}
+
+TEST_CASE("width of emoji clusters", "[width]") {
+  // Single emoji.
+  REQUIRE(width(U"\U0001F600") == 2);
+
+  // ZWJ sequence: family renders as one wide glyph.
+  REQUIRE(width(U"\U0001F468‍\U0001F469‍\U0001F467‍\U0001F466") ==
+          2);
+
+  // Flag: two regional indicators -> one wide glyph.
+  REQUIRE(width(U"\U0001F1EF\U0001F1F5") == 2);
+
+  // Emoji modifier sequence (thumbs up + skin tone).
+  REQUIRE(width(U"\U0001F44D\U0001F3FD") == 2);
+
+  // Variation selectors: VS16 forces wide, VS15 forces narrow.
+  REQUIRE(width(U"❤️") == 2);  // heart, emoji presentation
+  REQUIRE(width(U"❤︎") == 1);  // heart, text presentation
+
+  // Keycap: '1' + VS16 + COMBINING ENCLOSING KEYCAP.
+  REQUIRE(width(U"1️⃣") == 2);
+}
+
+TEST_CASE("width consistency with EastAsianWidth.txt", "[width]") {
+  std::ifstream fs("../UCD/EastAsianWidth.txt");
+  REQUIRE(fs);
+
+  auto to_enum = [](const std::string &s) {
+    if (s == "N") return EastAsianWidth::Neutral;
+    if (s == "A") return EastAsianWidth::Ambiguous;
+    if (s == "H") return EastAsianWidth::Halfwidth;
+    if (s == "W") return EastAsianWidth::Wide;
+    if (s == "F") return EastAsianWidth::Fullwidth;
+    return EastAsianWidth::Narrow;  // Na
+  };
+
+  std::string line;
+  while (std::getline(fs, line)) {
+    auto hash = line.find('#');
+    if (hash != std::string::npos) line = line.substr(0, hash);
+    auto semi = line.find(';');
+    if (semi == std::string::npos) continue;
+
+    std::string range = line.substr(0, semi);
+    std::string value = line.substr(semi + 1);
+    value.erase(0, value.find_first_not_of(" \t"));
+    value.erase(value.find_last_not_of(" \t\r") + 1);
+    if (value.empty()) continue;
+
+    auto dotdot = range.find("..");
+    char32_t first = std::stoul(range.substr(0, dotdot), nullptr, 16);
+    char32_t last = dotdot == std::string::npos
+                        ? first
+                        : std::stoul(range.substr(dotdot + 2), nullptr, 16);
+
+    auto expected = to_enum(value);
+    for (char32_t cp = first; cp <= last; cp++) {
+      REQUIRE(east_asian_width(cp) == expected);
+    }
+  }
+}
 
 // vim: et ts=2 sw=2 cin cino=\:0 ff=unix

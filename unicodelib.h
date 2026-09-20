@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -26,6 +27,16 @@ namespace unicode {
 //-----------------------------------------------------------------------------
 
 constexpr auto Unicode_Version = "17.0.0";
+
+//-----------------------------------------------------------------------------
+// Unicode Scalar Value
+//-----------------------------------------------------------------------------
+
+// D76 in the Unicode Standard: any code point except surrogates.
+// Named 'is_scalar_value' to avoid colliding with std::is_scalar.
+inline bool is_scalar_value(char32_t cp) {
+  return cp < 0xD800 || (0xE000 <= cp && cp <= 0x10FFFF);
+}
 
 //-----------------------------------------------------------------------------
 // General Category
@@ -188,32 +199,121 @@ char32_t simple_lowercase_mapping(char32_t cp);
 char32_t simple_titlecase_mapping(char32_t cp);
 char32_t simple_case_folding(char32_t cp);
 
+// A minimal BCP 47 locale. Only the primary language subtag is significant for
+// case mapping, and it is matched case-insensitively. So "tr", "tr-TR", "TR"
+// and "tr_TR" are all treated as Turkish.
+class Locale {
+ public:
+  Locale() = default;
+  Locale(const char *tag)
+      : language_(tag ? primary_subtag(tag) : std::string()) {}
+  Locale(std::string_view tag) : language_(primary_subtag(tag)) {}
+
+  // The lowercased primary language subtag (e.g. "tr" for "tr-TR").
+  std::string_view language() const { return language_; }
+
+  // True if the primary language subtag equals `primary` (case-insensitive).
+  bool is(std::string_view primary) const {
+    if (language_.size() != primary.size()) {
+      return false;
+    }
+    for (size_t i = 0; i < primary.size(); i++) {
+      if (language_[i] != to_lower_ascii(primary[i])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // True if a locale was specified.
+  explicit operator bool() const { return !language_.empty(); }
+
+ private:
+  static char to_lower_ascii(char c) {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+  }
+  static std::string primary_subtag(std::string_view tag) {
+    std::string out;
+    for (char c : tag) {
+      if (c == '-' || c == '_') {
+        break;
+      }
+      out += to_lower_ascii(c);
+    }
+    return out;
+  }
+  std::string language_;
+};
+
+// Opt-in case tailorings that are NOT implied by the locale. They are combined
+// with operator| (e.g. `CaseTailoring::TurkicCaseFold | CaseTailoring::...`).
+enum class CaseTailoring : unsigned {
+  None = 0,
+  // Use the Turkic full case folding mappings (the optional "T" mappings in
+  // CaseFolding.txt) for U+0049 and U+0130.
+  TurkicCaseFold = 1u << 0,
+  // When uppercasing, map U+00DF (ß) to U+1E9E (ẞ, LATIN CAPITAL LETTER SHARP
+  // S) instead of the default "SS".
+  GermanCapitalSharpS = 1u << 1,
+};
+
+constexpr CaseTailoring operator|(CaseTailoring a, CaseTailoring b) {
+  return static_cast<CaseTailoring>(static_cast<unsigned>(a) |
+                                    static_cast<unsigned>(b));
+}
+
+constexpr bool has_tailoring(CaseTailoring set, CaseTailoring flag) {
+  return (static_cast<unsigned>(set) & static_cast<unsigned>(flag)) != 0;
+}
+
+// Bundles the locale and the opt-in tailorings for the case operations. It is
+// implicitly constructible from a locale tag (`"tr"`), a Locale, or a
+// CaseTailoring, so most call sites stay terse.
+struct CaseOptions {
+  Locale locale;
+  CaseTailoring tailoring = CaseTailoring::None;
+
+  CaseOptions() = default;
+  CaseOptions(Locale locale) : locale(locale) {}
+  CaseOptions(const char *tag) : locale(tag) {}
+  CaseOptions(std::string_view tag) : locale(tag) {}
+  CaseOptions(CaseTailoring tailoring) : tailoring(tailoring) {}
+  CaseOptions(Locale locale, CaseTailoring tailoring)
+      : locale(locale), tailoring(tailoring) {}
+};
+
+inline CaseOptions operator|(Locale locale, CaseTailoring tailoring) {
+  return CaseOptions(locale, tailoring);
+}
+
+inline CaseOptions operator|(CaseOptions options, CaseTailoring tailoring) {
+  options.tailoring = options.tailoring | tailoring;
+  return options;
+}
+
 std::u32string to_uppercase(const char32_t *s32, size_t l,
-                            const char *lang = nullptr);
+                            const CaseOptions &options = {});
 std::u32string to_lowercase(const char32_t *s32, size_t l,
-                            const char *lang = nullptr);
+                            const CaseOptions &options = {});
 std::u32string to_titlecase(const char32_t *s32, size_t l,
-                            const char *lang = nullptr);
-std::u32string to_case_fold(
-    const char32_t *s32, size_t l,
-    bool special_case_for_uppercase_I_and_dotted_uppercase_I = false);
+                            const CaseOptions &options = {});
+std::u32string to_case_fold(const char32_t *s32, size_t l,
+                            const CaseOptions &options = {});
 
 bool is_uppercase(const char32_t *s32, size_t l);
 bool is_lowercase(const char32_t *s32, size_t l);
 bool is_titlecase(const char32_t *s32, size_t l);
 bool is_case_fold(const char32_t *s32, size_t l);
 
-bool caseless_match(
-    const char32_t *s1, size_t l1, const char32_t *s2, size_t l2,
-    bool special_case_for_uppercase_I_and_dotted_uppercase_I = false);
+bool caseless_match(const char32_t *s1, size_t l1, const char32_t *s2,
+                    size_t l2, const CaseOptions &options = {});
 
-bool canonical_caseless_match(
-    const char32_t *s1, size_t l1, const char32_t *s2, size_t l2,
-    bool special_case_for_uppercase_I_and_dotted_uppercase_I = false);
+bool canonical_caseless_match(const char32_t *s1, size_t l1, const char32_t *s2,
+                              size_t l2, const CaseOptions &options = {});
 
-bool compatibility_caseless_match(
-    const char32_t *s1, size_t l1, const char32_t *s2, size_t l2,
-    bool special_case_for_uppercase_I_and_dotted_uppercase_I = false);
+bool compatibility_caseless_match(const char32_t *s1, size_t l1,
+                                  const char32_t *s2, size_t l2,
+                                  const CaseOptions &options = {});
 
 //-----------------------------------------------------------------------------
 // Text Segmentation
@@ -804,47 +904,43 @@ std::u32string to_nfkd(const char32_t *s32, size_t l);
 //-----------------------------------------------------------------------------
 
 inline std::u32string to_uppercase(const std::u32string_view s32,
-                                   const char *lang = nullptr) {
-  return to_uppercase(s32.data(), s32.length(), lang);
+                                   const CaseOptions &options = {}) {
+  return to_uppercase(s32.data(), s32.length(), options);
 }
 
 inline std::u32string to_uppercase(const char32_t *s32,
-                                   const char *lang = nullptr) {
-  return to_uppercase(s32, std::char_traits<char32_t>::length(s32), lang);
+                                   const CaseOptions &options = {}) {
+  return to_uppercase(s32, std::char_traits<char32_t>::length(s32), options);
 }
 
 inline std::u32string to_lowercase(const std::u32string_view s32,
-                                   const char *lang = nullptr) {
-  return to_lowercase(s32.data(), s32.length(), lang);
+                                   const CaseOptions &options = {}) {
+  return to_lowercase(s32.data(), s32.length(), options);
 }
 
 inline std::u32string to_lowercase(const char32_t *s32,
-                                   const char *lang = nullptr) {
-  return to_lowercase(s32, std::char_traits<char32_t>::length(s32), lang);
+                                   const CaseOptions &options = {}) {
+  return to_lowercase(s32, std::char_traits<char32_t>::length(s32), options);
 }
 
 inline std::u32string to_titlecase(const std::u32string_view s32,
-                                   const char *lang = nullptr) {
-  return to_titlecase(s32.data(), s32.length(), lang);
+                                   const CaseOptions &options = {}) {
+  return to_titlecase(s32.data(), s32.length(), options);
 }
 
 inline std::u32string to_titlecase(const char32_t *s32,
-                                   const char *lang = nullptr) {
-  return to_titlecase(s32, std::char_traits<char32_t>::length(s32), lang);
+                                   const CaseOptions &options = {}) {
+  return to_titlecase(s32, std::char_traits<char32_t>::length(s32), options);
 }
 
-inline std::u32string to_case_fold(
-    const std::u32string_view s32,
-    bool special_case_for_uppercase_I_and_dotted_uppercase_I = false) {
-  return to_case_fold(s32.data(), s32.length(),
-                      special_case_for_uppercase_I_and_dotted_uppercase_I);
+inline std::u32string to_case_fold(const std::u32string_view s32,
+                                   const CaseOptions &options = {}) {
+  return to_case_fold(s32.data(), s32.length(), options);
 }
 
-inline std::u32string to_case_fold(
-    const char32_t *s32,
-    bool special_case_for_uppercase_I_and_dotted_uppercase_I = false) {
-  return to_case_fold(s32, std::char_traits<char32_t>::length(s32),
-                      special_case_for_uppercase_I_and_dotted_uppercase_I);
+inline std::u32string to_case_fold(const char32_t *s32,
+                                   const CaseOptions &options = {}) {
+  return to_case_fold(s32, std::char_traits<char32_t>::length(s32), options);
 }
 
 inline bool is_uppercase(const std::u32string_view s32) {
@@ -879,53 +975,45 @@ inline bool is_case_fold(const char32_t *s32) {
   return is_case_fold(s32, std::char_traits<char32_t>::length(s32));
 }
 
-inline bool caseless_match(
-    const std::u32string_view s1, const std::u32string_view s2,
-    bool special_case_for_uppercase_I_and_dotted_uppercase_I = false) {
+inline bool caseless_match(const std::u32string_view s1,
+                           const std::u32string_view s2,
+                           const CaseOptions &options = {}) {
   return caseless_match(s1.data(), s1.length(), s2.data(), s2.length(),
-                        special_case_for_uppercase_I_and_dotted_uppercase_I);
+                        options);
 }
 
-inline bool caseless_match(
-    const char32_t *s1, const char32_t *s2,
-    bool special_case_for_uppercase_I_and_dotted_uppercase_I = false) {
+inline bool caseless_match(const char32_t *s1, const char32_t *s2,
+                           const CaseOptions &options = {}) {
   return caseless_match(s1, std::char_traits<char32_t>::length(s1), s2,
-                        std::char_traits<char32_t>::length(s2),
-                        special_case_for_uppercase_I_and_dotted_uppercase_I);
+                        std::char_traits<char32_t>::length(s2), options);
 }
 
-inline bool canonical_caseless_match(
-    const std::u32string_view s1, const std::u32string_view s2,
-    bool special_case_for_uppercase_I_and_dotted_uppercase_I = false) {
-  return canonical_caseless_match(
-      s1.data(), s1.length(), s2.data(), s2.length(),
-      special_case_for_uppercase_I_and_dotted_uppercase_I);
+inline bool canonical_caseless_match(const std::u32string_view s1,
+                                     const std::u32string_view s2,
+                                     const CaseOptions &options = {}) {
+  return canonical_caseless_match(s1.data(), s1.length(), s2.data(),
+                                  s2.length(), options);
 }
 
-inline bool canonical_caseless_match(
-    const char32_t *s1, const char32_t *s2,
-    bool special_case_for_uppercase_I_and_dotted_uppercase_I = false) {
-  return canonical_caseless_match(
-      s1, std::char_traits<char32_t>::length(s1), s2,
-      std::char_traits<char32_t>::length(s2),
-      special_case_for_uppercase_I_and_dotted_uppercase_I);
+inline bool canonical_caseless_match(const char32_t *s1, const char32_t *s2,
+                                     const CaseOptions &options = {}) {
+  return canonical_caseless_match(s1, std::char_traits<char32_t>::length(s1),
+                                  s2, std::char_traits<char32_t>::length(s2),
+                                  options);
 }
 
-inline bool compatibility_caseless_match(
-    const std::u32string_view s1, const std::u32string_view s2,
-    bool special_case_for_uppercase_I_and_dotted_uppercase_I = false) {
-  return compatibility_caseless_match(
-      s1.data(), s1.length(), s2.data(), s2.length(),
-      special_case_for_uppercase_I_and_dotted_uppercase_I);
+inline bool compatibility_caseless_match(const std::u32string_view s1,
+                                         const std::u32string_view s2,
+                                         const CaseOptions &options = {}) {
+  return compatibility_caseless_match(s1.data(), s1.length(), s2.data(),
+                                      s2.length(), options);
 }
 
-inline bool compatibility_caseless_match(
-    const char32_t *s1, const char32_t *s2,
-    bool special_case_for_uppercase_I_and_dotted_uppercase_I = false) {
+inline bool compatibility_caseless_match(const char32_t *s1, const char32_t *s2,
+                                         const CaseOptions &options = {}) {
   return compatibility_caseless_match(
       s1, std::char_traits<char32_t>::length(s1), s2,
-      std::char_traits<char32_t>::length(s2),
-      special_case_for_uppercase_I_and_dotted_uppercase_I);
+      std::char_traits<char32_t>::length(s2), options);
 }
 
 inline std::u32string to_nfc(const std::u32string_view s32) {
@@ -1115,6 +1203,47 @@ enum class Emoji {
   Extended_Pictographic,
 // -------- [END GENERATED BLOCK] --------
 };
+
+//-----------------------------------------------------------------------------
+// East Asian Width (UAX #11) and Display Width
+//-----------------------------------------------------------------------------
+
+// East_Asian_Width property values defined by UAX #11. These six values are
+// fixed by the standard, so the enum is hand-written; the lookup table is
+// generated from 'EastAsianWidth.txt' (see scripts/gen_tables.py).
+enum class EastAsianWidth {
+  Neutral,    // N
+  Ambiguous,  // A
+  Halfwidth,  // H
+  Wide,       // W
+  Fullwidth,  // F
+  Narrow,     // Na
+};
+
+// Resolved East_Asian_Width property of a single code point.
+EastAsianWidth east_asian_width(char32_t cp);
+
+// Policy for how Ambiguous-width (A) characters are counted as display
+// columns. Modern, non-East-Asian terminals treat them as 1 (Narrow); legacy
+// East-Asian environments treat them as 2 (Wide).
+enum class AmbiguousWidth {
+  Narrow,
+  Wide,
+};
+
+// Number of terminal columns occupied by a single Unicode scalar:
+//   0  controls, format characters, nonspacing/enclosing combining marks
+//   2  East_Asian_Width Wide/Fullwidth, or Emoji_Presentation
+//   1  everything else (Ambiguous follows the `amb` policy)
+// This is a derived heuristic (UAX #11 + General_Category + UTS #51), not a
+// normative Unicode property.
+int codepoint_width(char32_t cp, AmbiguousWidth amb = AmbiguousWidth::Narrow);
+
+// Display width of a string, measured per extended grapheme cluster so that
+// emoji ZWJ sequences, flags, keycaps and base+variation-selector sequences
+// each count as one cell group rather than the sum of their scalars.
+int width(const char32_t *s32, size_t l,
+          AmbiguousWidth amb = AmbiguousWidth::Narrow);
 
 //-----------------------------------------------------------------------------
 // Unicode Data
@@ -3564,6 +3693,9 @@ static const GeneralCategory _block_values[] = {
  T::Co,T::Co,T::Co,T::Co,T::Co,T::Co,T::Co,D,
 };
 inline GeneralCategory get_value(char32_t cp) {
+  if (cp > 0x10FFFF) {
+    return D;
+  }
   auto i = cp / _block_size;
   auto bl = _blocks[i];
   if (bl) {
@@ -5966,6 +6098,9 @@ static const uint64_t _block_values[] = {
  0,0,0,0,0,0,0,0,
 };
 inline uint64_t get_value(char32_t cp) {
+  if (cp > 0x10FFFF) {
+    return 0;
+  }
   auto i = cp / _block_size;
   auto bl = _blocks[i];
   if (bl) {
@@ -8411,6 +8546,9 @@ static const uint32_t _block_values[] = {
  0,0,0,0,0,0,0,0,
 };
 inline uint32_t get_value(char32_t cp) {
+  if (cp > 0x10FFFF) {
+    return 0;
+  }
   auto i = cp / _block_size;
   auto bl = _blocks[i];
   if (bl) {
@@ -17633,6 +17771,9 @@ static const Block _block_values[] = {
  T::SupplementaryPrivateUseAreaB,T::SupplementaryPrivateUseAreaB,T::SupplementaryPrivateUseAreaB,T::SupplementaryPrivateUseAreaB,T::SupplementaryPrivateUseAreaB,T::SupplementaryPrivateUseAreaB,T::SupplementaryPrivateUseAreaB,T::SupplementaryPrivateUseAreaB,
 };
 inline Block get_value(char32_t cp) {
+  if (cp > 0x10FFFF) {
+    return D;
+  }
   auto i = cp / _block_size;
   auto bl = _blocks[i];
   if (bl) {
@@ -20058,6 +20199,9 @@ static const Script _block_values[] = {
  D,D,D,D,D,D,D,D,
 };
 inline Script get_value(char32_t cp) {
+  if (cp > 0x10FFFF) {
+    return D;
+  }
   auto i = cp / _block_size;
   auto bl = _blocks[i];
   if (bl) {
@@ -21974,6 +22118,9 @@ static const int _block_values[] = {
  -1,-1,-1,-1,-1,-1,-1,-1,
 };
 inline int get_value(char32_t cp) {
+  if (cp > 0x10FFFF) {
+    return 0;
+  }
   auto i = cp / _block_size;
   auto bl = _blocks[i];
   if (bl) {
@@ -24339,6 +24486,9 @@ static const NormalizationProperties _block_values[] = {
  {0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},{0,0,0},
 };
 inline NormalizationProperties get_value(char32_t cp) {
+  if (cp > 0x10FFFF) {
+    return {0,0,0};
+  }
   auto i = cp / _block_size;
   auto bl = _blocks[i];
   if (bl) {
@@ -27708,6 +27858,9 @@ static const GraphemeBreak _block_values[] = {
  D,D,D,D,D,D,D,D,
 };
 inline GraphemeBreak get_value(char32_t cp) {
+  if (cp > 0x10FFFF) {
+    return D;
+  }
   auto i = cp / _block_size;
   auto bl = _blocks[i];
   if (bl) {
@@ -30101,6 +30254,9 @@ static const WordBreak _block_values[] = {
  D,D,D,D,D,D,D,D,
 };
 inline WordBreak get_value(char32_t cp) {
+  if (cp > 0x10FFFF) {
+    return D;
+  }
   auto i = cp / _block_size;
   auto bl = _blocks[i];
   if (bl) {
@@ -32520,6 +32676,9 @@ static const SentenceBreak _block_values[] = {
  D,D,D,D,D,D,D,D,
 };
 inline SentenceBreak get_value(char32_t cp) {
+  if (cp > 0x10FFFF) {
+    return D;
+  }
   auto i = cp / _block_size;
   auto bl = _blocks[i];
   if (bl) {
@@ -33652,6 +33811,1166 @@ static const Emoji _block_values[] = {
  D,D,D,D,D,D,D,D,
 };
 inline Emoji get_value(char32_t cp) {
+  if (cp > 0x10FFFF) {
+    return D;
+  }
+  auto i = cp / _block_size;
+  auto bl = _blocks[i];
+  if (bl) {
+    auto off = cp % _block_size;
+    return bl[off];
+  }
+  return _block_values[i];
+}
+}
+namespace _east_asian_width_properties {
+using T = EastAsianWidth;
+const auto D = EastAsianWidth::Neutral;
+static const size_t _block_size = 256;
+static const EastAsianWidth _0[] = { D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,T::Narrow,T::Narrow,T::Ambiguous,T::Narrow,T::Narrow,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,D,T::Narrow,T::Ambiguous,T::Ambiguous,T::Narrow,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,D,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,D,D,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,D,T::Ambiguous,D, };
+static const EastAsianWidth _1[] = { D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,T::Ambiguous,D,D,D,D,D,D,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,D,D,D,T::Ambiguous,D,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,T::Ambiguous,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,D,D,D,D,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,D,D,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,T::Ambiguous,D,T::Ambiguous,D,T::Ambiguous,D,T::Ambiguous,D,T::Ambiguous,D,T::Ambiguous,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _2[] = { D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,D,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,D,D,T::Ambiguous,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _3[] = { T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _4[] = { D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _17[] = { T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _32[] = { D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,D,D,T::Ambiguous,T::Ambiguous,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,D,D,D,D,D,T::Ambiguous,D,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Halfwidth,D,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _33[] = { D,D,D,T::Ambiguous,D,T::Ambiguous,D,D,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,D,D,D,T::Ambiguous,D,D,D,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _34[] = { T::Ambiguous,D,T::Ambiguous,T::Ambiguous,D,D,D,T::Ambiguous,T::Ambiguous,D,D,T::Ambiguous,D,D,D,T::Ambiguous,D,T::Ambiguous,D,D,D,T::Ambiguous,D,D,D,D,T::Ambiguous,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,T::Ambiguous,D,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,D,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,D,D,T::Ambiguous,D,D,D,D,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,T::Ambiguous,T::Ambiguous,D,D,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,D,D,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,D,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _35[] = { D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,D,D,D,D,D,D,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,T::Wide,D,D,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _36[] = { D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous, };
+static const EastAsianWidth _37[] = { T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,D,D,T::Ambiguous,T::Ambiguous,D,D,D,D,T::Ambiguous,T::Ambiguous,D,D,T::Ambiguous,T::Ambiguous,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,T::Ambiguous,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,D, };
+static const EastAsianWidth _38[] = { D,D,D,D,D,T::Ambiguous,T::Ambiguous,D,D,T::Ambiguous,D,D,D,D,T::Ambiguous,T::Ambiguous,D,D,D,D,T::Wide,T::Wide,D,D,D,D,D,D,T::Ambiguous,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,T::Ambiguous,D,T::Ambiguous,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,T::Wide,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,D,T::Wide,D,D,D,D,D,D,D,D,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Ambiguous,D,D,D,D,T::Wide,T::Wide,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Wide,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Wide,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,T::Ambiguous,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Wide,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Wide,T::Wide,T::Ambiguous,T::Wide,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Wide,T::Ambiguous,T::Ambiguous,T::Wide,T::Ambiguous,T::Ambiguous, };
+static const EastAsianWidth _39[] = { D,D,D,D,D,T::Wide,D,D,D,D,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,D,T::Wide,D,D,D,D,T::Wide,T::Wide,T::Wide,D,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,T::Narrow,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _41[] = { D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Narrow,T::Narrow,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _43[] = { D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,D,D,D,D,T::Wide,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _46[] = { D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _47[] = { T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide, };
+static const EastAsianWidth _48[] = { T::Fullwidth,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide, };
+static const EastAsianWidth _49[] = { D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide, };
+static const EastAsianWidth _50[] = { T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide, };
+static const EastAsianWidth _164[] = { T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _169[] = { D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _215[] = { T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _254[] = { T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _255[] = { D,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,D,D,D,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,D,D,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,D,D,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,D,D,T::Halfwidth,T::Halfwidth,T::Halfwidth,D,D,D,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,T::Fullwidth,D,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,T::Halfwidth,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Ambiguous,D,D, };
+static const EastAsianWidth _367[] = { D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _396[] = { T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide, };
+static const EastAsianWidth _397[] = { T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _431[] = { D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,T::Wide,T::Wide,D, };
+static const EastAsianWidth _433[] = { T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,D,D,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide, };
+static const EastAsianWidth _434[] = { T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D, };
+static const EastAsianWidth _467[] = { T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _496[] = { D,D,D,D,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _497[] = { T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Wide,T::Ambiguous,T::Ambiguous,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _498[] = { T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _499[] = { T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,T::Wide,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide, };
+static const EastAsianWidth _500[] = { T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,T::Wide,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,T::Wide, };
+static const EastAsianWidth _501[] = { T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide, };
+static const EastAsianWidth _502[] = { T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,T::Wide,D,D,D,T::Wide,T::Wide,T::Wide,D,D,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D, };
+static const EastAsianWidth _503[] = { D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,T::Wide,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _505[] = { D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide, };
+static const EastAsianWidth _506[] = { D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,T::Wide,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,D,D,D, };
+static const EastAsianWidth _767[] = { T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D, };
+static const EastAsianWidth _1023[] = { T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,D, };
+static const EastAsianWidth _3585[] = { T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D, };
+static const EastAsianWidth _4095[] = { T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D, };
+static const EastAsianWidth _4351[] = { T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,D, };
+static const EastAsianWidth *_blocks[] = {
+ _0,_1,_2,_3,_4,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,_17,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ _32,_33,_34,_35,_36,_37,_38,_39,
+ 0,_41,0,_43,0,0,_46,_47,
+ _48,_49,_50,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,_164,0,0,0,
+ 0,_169,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,_215,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,_254,_255,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,_367,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,_396,_397,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,_431,
+ 0,_433,_434,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,_467,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ _496,_497,_498,_499,_500,_501,_502,_503,
+ 0,_505,_506,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,_767,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,_1023,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,_3585,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,_4095,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,0,
+ 0,0,0,0,0,0,0,_4351,
+};
+static const EastAsianWidth _block_values[] = {
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,
+ D,D,D,D,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,
+ D,D,D,D,D,D,D,D,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Wide,T::Wide,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ T::Wide,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,
+ T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,T::Wide,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ D,D,D,D,D,D,D,D,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,
+ T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,T::Ambiguous,D,
+};
+inline EastAsianWidth get_value(char32_t cp) {
+  if (cp > 0x10FFFF) {
+    return D;
+  }
   auto i = cp / _block_size;
   auto bl = _blocks[i];
   if (bl) {
@@ -34279,16 +35598,10 @@ inline char32_t simple_case_folding(char32_t cp) {
   return cp;
 }
 
-inline bool is_language_qualified(const char *user_lang,
-                                  const char *spec_lang) {
-  return !spec_lang || (user_lang && !strcmp(user_lang, spec_lang));
-}
-
-inline bool is_dutch(const char *lang) {
-  // Check for Dutch language code (nl, nl-NL, nl-BE, etc.)
-  return lang && (strcmp(lang, "nl") == 0 ||
-                  (strncmp(lang, "nl-", 3) == 0) ||
-                  (strncmp(lang, "nl_", 3) == 0));
+inline bool is_language_qualified(const Locale &locale, const char *spec_lang) {
+  // A SpecialCasing entry with no language applies to every locale; otherwise
+  // the locale's primary language subtag must match (e.g. "tr", "az", "lt").
+  return !spec_lang || locale.is(spec_lang);
 }
 
 inline bool is_final_sigma(const char32_t *s32, size_t l, size_t i) {
@@ -34397,7 +35710,7 @@ inline bool is_after_i(const char32_t *s32, size_t l, size_t i) {
 }
 
 inline void full_case_mapping(const char32_t *s32, size_t l, size_t i,
-                              const char *lang, CaseMappingType type,
+                              const CaseOptions &options, CaseMappingType type,
                               std::u32string &out) {
   // D135 A character C is defined to be cased if and only if C has the
   // Lowercase or Uppercase property or has a General_Category value of
@@ -34426,12 +35739,21 @@ inline void full_case_mapping(const char32_t *s32, size_t l, size_t i,
   // matching if and only if it matches the corresponding specification in Table
   // 3-17.
   auto cp = s32[i];
+
+  // German capital sharp s tailoring (opt-in, not implied by the locale): when
+  // uppercasing, map U+00DF (ß) to U+1E9E (ẞ) rather than the default "SS".
+  if (type == CaseMappingType::Upper && cp == 0x000000DF &&
+      has_tailoring(options.tailoring, CaseTailoring::GermanCapitalSharpS)) {
+    out += U'\U00001E9E';
+    return;
+  }
+
   auto count = _special_case_mappings.count(cp);
   if (count != 0) {
     auto r = _special_case_mappings.equal_range(cp);
     for (auto it = r.first; it != r.second; ++it) {
       const auto &sc = it->second;
-      if (is_language_qualified(lang, sc.language)) {
+      if (is_language_qualified(options.locale, sc.language)) {
         auto handle = false;
         switch (sc.context) {
           case SpecialCasingContext::Final_Sigma:
@@ -34476,42 +35798,42 @@ inline void full_case_mapping(const char32_t *s32, size_t l, size_t i,
 }
 
 inline void uppercase_mapping(const char32_t *s32, size_t l, size_t i,
-                              const char *lang, std::u32string &out) {
-  full_case_mapping(s32, l, i, lang, CaseMappingType::Upper, out);
+                              const CaseOptions &options, std::u32string &out) {
+  full_case_mapping(s32, l, i, options, CaseMappingType::Upper, out);
 }
 
 inline void lowercase_mapping(const char32_t *s32, size_t l, size_t i,
-                              const char *lang, std::u32string &out) {
-  full_case_mapping(s32, l, i, lang, CaseMappingType::Lower, out);
+                              const CaseOptions &options, std::u32string &out) {
+  full_case_mapping(s32, l, i, options, CaseMappingType::Lower, out);
 }
 
 inline void titlecase_mapping(const char32_t *s32, size_t l, size_t i,
-                              const char *lang, std::u32string &out) {
-  full_case_mapping(s32, l, i, lang, CaseMappingType::Title, out);
+                              const CaseOptions &options, std::u32string &out) {
+  full_case_mapping(s32, l, i, options, CaseMappingType::Title, out);
 }
 
 inline std::u32string to_uppercase(const char32_t *s32, size_t l,
-                                   const char *lang) {
+                                   const CaseOptions &options) {
   // R1 toUppercase(X): Map each character C in X to Uppercase_Mapping(C)
   std::u32string out;
   for (size_t i = 0; i < l; i++) {
-    uppercase_mapping(s32, l, i, lang, out);
+    uppercase_mapping(s32, l, i, options, out);
   }
   return out;
 }
 
 inline std::u32string to_lowercase(const char32_t *s32, size_t l,
-                                   const char *lang) {
+                                   const CaseOptions &options) {
   // R2 toLowercase(X): Map each character C in X to Lowercase_Mapping(C)
   std::u32string out;
   for (size_t i = 0; i < l; i++) {
-    lowercase_mapping(s32, l, i, lang, out);
+    lowercase_mapping(s32, l, i, options, out);
   }
   return out;
 }
 
 inline std::u32string to_titlecase(const char32_t *s32, size_t l,
-                                   const char *lang) {
+                                   const CaseOptions &options) {
   // R3 toTitlecase(X): Find the word boundaries in X according to Unicode
   // Standard Annex #29, “Unicode Text Segmentation.” For each word boundary,
   // find the first cased character F following the word boundary. If F exists,
@@ -34529,13 +35851,13 @@ inline std::u32string to_titlecase(const char32_t *s32, size_t l,
       break;
     }
 
-    titlecase_mapping(s32, l, i, lang, out);
+    titlecase_mapping(s32, l, i, options, out);
     i++;
 
-    // Special case for Dutch IJ titlecasing:
-    // When the first letter of a word is 'I' (or 'Í') followed by 'j',
-    // both letters should be capitalized: "ijsje" -> "IJsje"
-    if (is_dutch(lang) && !out.empty()) {
+    // Special case for Dutch IJ titlecasing (a locale tailoring not covered by
+    // SpecialCasing.txt; see CLDR nl-Title.xml). When a word begins with 'ij',
+    // both letters are capitalized: "ijsje" -> "IJsje".
+    if (options.locale.is("nl") && !out.empty()) {
       auto last = out.back();
       if ((last == U'I' || last == U'Í') && i < l &&
           (s32[i] == U'j' || s32[i] == U'J')) {
@@ -34549,20 +35871,20 @@ inline std::u32string to_titlecase(const char32_t *s32, size_t l,
     }
 
     while (i < l && !is_word_boundary(s32, l, i)) {
-      lowercase_mapping(s32, l, i, lang, out);
+      lowercase_mapping(s32, l, i, options, out);
       i++;
     }
   }
   return out;
 }
 
-inline void case_folding(
-    char32_t cp, bool special_case_for_uppercase_I_and_dotted_uppercase_I,
-    std::u32string &out) {
+inline void case_folding(char32_t cp, const CaseOptions &options,
+                         std::u32string &out) {
   auto it = _case_foldings.find(cp);
   if (it != _case_foldings.end()) {
     const auto &cf = it->second;
-    if (special_case_for_uppercase_I_and_dotted_uppercase_I && cf.T) {
+    if (has_tailoring(options.tailoring, CaseTailoring::TurkicCaseFold) &&
+        cf.T) {
       out += cf.T;
       return;
     } else if (cf.F) {
@@ -34579,14 +35901,12 @@ inline void case_folding(
   out += cp;
 }
 
-inline std::u32string to_case_fold(
-    const char32_t *s32, size_t l,
-    bool special_case_for_uppercase_I_and_dotted_uppercase_I) {
+inline std::u32string to_case_fold(const char32_t *s32, size_t l,
+                                   const CaseOptions &options) {
   // R4 toCasefold(X): Map each character C in X to Case_Folding(C)
   std::u32string out;
   for (size_t i = 0; i < l; i++) {
-    case_folding(s32[i], special_case_for_uppercase_I_and_dotted_uppercase_I,
-                 out);
+    case_folding(s32[i], options, out);
   }
   return out;
 }
@@ -34656,59 +35976,42 @@ inline bool is_case_fold(const char32_t *s32, size_t l) {
   return true;
 }
 
-inline bool caseless_match(
-    const char32_t *s1, size_t l1, const char32_t *s2, size_t l2,
-    bool special_case_for_uppercase_I_and_dotted_uppercase_I) {
+inline bool caseless_match(const char32_t *s1, size_t l1, const char32_t *s2,
+                           size_t l2, const CaseOptions &options) {
   // D144 A string X is a caseless match for a string Y if and only if
   // toCasefold(X) = toCasefold(Y)
-  return to_case_fold(s1, l1,
-                      special_case_for_uppercase_I_and_dotted_uppercase_I) ==
-         to_case_fold(s2, l2,
-                      special_case_for_uppercase_I_and_dotted_uppercase_I);
+  return to_case_fold(s1, l1, options) == to_case_fold(s2, l2, options);
 }
 
-inline bool canonical_caseless_match(
-    const char32_t *s1, size_t l1, const char32_t *s2, size_t l2,
-    bool special_case_for_uppercase_I_and_dotted_uppercase_I) {
+inline bool canonical_caseless_match(const char32_t *s1, size_t l1,
+                                     const char32_t *s2, size_t l2,
+                                     const CaseOptions &options) {
   // D145 A string X is a canonical caseless match for a string Y if and only if
   // NFD(toCasefold(NFD(X))) = NFD(toCasefold(NFD(Y)))
-  return to_nfd(to_case_fold(
-             to_nfd(s1, l1),
-             special_case_for_uppercase_I_and_dotted_uppercase_I)) ==
-         to_nfd(
-             to_case_fold(to_nfd(s2, l2),
-                          special_case_for_uppercase_I_and_dotted_uppercase_I));
+  return to_nfd(to_case_fold(to_nfd(s1, l1), options)) ==
+         to_nfd(to_case_fold(to_nfd(s2, l2), options));
 }
 
-inline bool compatibility_caseless_match(
-    const char32_t *s1, size_t l1, const char32_t *s2, size_t l2,
-    bool special_case_for_uppercase_I_and_dotted_uppercase_I) {
+inline bool compatibility_caseless_match(const char32_t *s1, size_t l1,
+                                         const char32_t *s2, size_t l2,
+                                         const CaseOptions &options) {
   // D146 A string X is a compatibility caseless match for a string Y if and
   // only if NFKD(toCasefold(NFKD(toCasefold(NFD(X))))) =
   // NFKD(toCasefold(NFKD(toCasefold(NFD(Y)))))
-  return to_nfkd(to_case_fold(
-             to_nfkd(to_case_fold(
-                 to_nfd(s1, l1),
-                 special_case_for_uppercase_I_and_dotted_uppercase_I)),
-             special_case_for_uppercase_I_and_dotted_uppercase_I)) ==
-         to_nfkd(to_case_fold(
-             to_nfkd(to_case_fold(
-                 to_nfd(s2, l2),
-                 special_case_for_uppercase_I_and_dotted_uppercase_I)),
-             special_case_for_uppercase_I_and_dotted_uppercase_I));
+  return to_nfkd(to_case_fold(to_nfkd(to_case_fold(to_nfd(s1, l1), options)),
+                              options)) ==
+         to_nfkd(to_case_fold(to_nfkd(to_case_fold(to_nfd(s2, l2), options)),
+                              options));
 }
 
 #if 0 // TODO
-inline bool identifier_caseless_match(
-    const char32_t *s1, size_t l1, const char32_t *s2, size_t l2,
-    bool special_case_for_uppercase_I_and_dotted_uppercase_I) {
+inline bool identifier_caseless_match(const char32_t *s1, size_t l1,
+                                      const char32_t *s2, size_t l2,
+                                      const CaseOptions &options) {
   // D147 A string X is an identifier caseless match for a string Y if and
   // only if toNFKC_Casefold(NFD(X)) = toNFKC_Casefold(NFD(Y))
-  return to_nfkc_case_fold(
-             to_nfd(s1, l1),
-             special_case_for_uppercase_I_and_dotted_uppercase_I) ==
-         to_nfkc_case_fold(to_nfd(s2, l2),
-                           special_case_for_uppercase_I_and_dotted_uppercase_I);
+  return to_nfkc_case_fold(to_nfd(s1, l1), options) ==
+         to_nfkc_case_fold(to_nfd(s2, l2), options);
 }
 #endif
 
@@ -35571,6 +36874,94 @@ inline bool is_script(Script sc, char32_t cp) {
     default:
       return sc == val;
   }
+}
+
+//-----------------------------------------------------------------------------
+// East Asian Width / Display Width
+//-----------------------------------------------------------------------------
+
+inline EastAsianWidth east_asian_width(char32_t cp) {
+  return _east_asian_width_properties::get_value(cp);
+}
+
+inline int codepoint_width(char32_t cp, AmbiguousWidth amb) {
+  if (cp == 0) {
+    return 0;
+  }
+
+  // Controls, format characters (incl. ZWJ U+200D) and nonspacing/enclosing
+  // combining marks add no advance of their own.
+  auto gc = general_category(cp);
+  if (gc == GeneralCategory::Cc || gc == GeneralCategory::Cf ||
+      gc == GeneralCategory::Mn || gc == GeneralCategory::Me) {
+    return 0;
+  }
+
+  auto eaw = east_asian_width(cp);
+  if (eaw == EastAsianWidth::Wide || eaw == EastAsianWidth::Fullwidth) {
+    return 2;
+  }
+
+  // Characters whose default presentation is emoji occupy two cells.
+  if (_emoji_properties::get_value(cp) == Emoji::Emoji_Presentation) {
+    return 2;
+  }
+
+  if (eaw == EastAsianWidth::Ambiguous) {
+    return amb == AmbiguousWidth::Wide ? 2 : 1;
+  }
+
+  return 1;
+}
+
+inline int width(const char32_t *s32, size_t l, AmbiguousWidth amb) {
+  int total = 0;
+  size_t i = 0;
+  while (i < l) {
+    auto len = grapheme_length(s32 + i, l - i);
+
+    // The base width comes from the first scalar of the cluster.
+    int w = codepoint_width(s32[i], amb);
+
+    // A variation selector overrides the presentation of the cluster:
+    //   U+FE0F (VS16) forces emoji presentation -> wide
+    //   U+FE0E (VS15) forces text presentation  -> narrow
+    bool vs16 = false, vs15 = false;
+    for (size_t k = i; k < i + len; k++) {
+      if (s32[k] == 0xFE0F) {
+        vs16 = true;
+      } else if (s32[k] == 0xFE0E) {
+        vs15 = true;
+      }
+    }
+    if (vs16) {
+      w = 2;
+    } else if (vs15) {
+      w = 1;
+    }
+
+    // A regional-indicator pair renders as a single wide flag glyph.
+    if (s32[i] >= 0x1F1E6 && s32[i] <= 0x1F1FF) {
+      w = 2;
+    }
+
+    if (w < 0) {
+      w = 0;
+    }
+    total += w;
+    i += len;
+  }
+  return total;
+}
+
+inline int width(const std::u32string_view s32,
+                 AmbiguousWidth amb = AmbiguousWidth::Narrow) {
+  return width(s32.data(), s32.length(), amb);
+}
+
+inline int width(const char32_t *s32,
+                 AmbiguousWidth amb = AmbiguousWidth::Narrow) {
+  return width(s32, std::char_traits<char32_t>::length(s32), amb);
 }
 
 //-----------------------------------------------------------------------------
