@@ -20,7 +20,8 @@ ValueTypes = {
     'uint16_t': (2, False),
     'uint32_t': (4, False),
     'uint64_t': (8, False),
-    'NormalizationProperties': (24, False),
+    'const char *': (8, False),
+    'const char32_t *': (8, False),
     'GeneralCategory': (4, True),
     'Block': (4, True),
     'Script': (4, True),
@@ -50,6 +51,59 @@ def sorted_by_code_point(rows, unique=True):
 def assign_index(indices, cp, i):
     indices += [0] * (cp + 1 - len(indices))
     indices[cp] = i
+
+#------------------------------------------------------------------------------
+# UnicodeData.txt
+#------------------------------------------------------------------------------
+
+def unicodeDataRuns(ucd):
+    """Yield (first, last, fields) for every run of code points the file lists.
+
+    Almost every run is one code point. A "<..., First>" line and the
+    "<..., Last>" line after it stand for the whole range between them, and
+    the two carry identical property fields, so the run takes the First
+    line's.
+    """
+    data = [x.rstrip().split(';') for x in open(ucd + '/UnicodeData.txt')]
+    i = 0
+    while i < len(data):
+        flds = data[i]
+        first = int(flds[0], 16)
+        if flds[1].endswith('First>'):
+            yield first, int(data[i + 1][0], 16), flds
+            i += 2
+        else:
+            yield first, first, flds
+            i += 1
+
+def unicodeDataValues(ucd, gapValue, extract):
+    """Yield one value per code point, U+0000 through U+10FFFF.
+
+    `extract(fields)` gives the value for a code point the file lists; every
+    other one is unassigned and takes `gapValue`. Filling those with a
+    neighbour's value instead is what once gave 441 unassigned code points a
+    nonzero canonical combining class.
+    """
+    prev = -1
+    for first, last, flds in unicodeDataRuns(ucd):
+        for _ in range(prev + 1, first):
+            yield gapValue
+        value = extract(flds)
+        for _ in range(first, last + 1):
+            yield value
+        prev = last
+    for _ in range(prev + 1, MaxCopePoint + 1):
+        yield gapValue
+
+DecompositionRe = re.compile(r"(?:<(\w+)> )?(.+)")
+
+def parseDecomposition(field):
+    """(compatibility format tag or None, code points) for a decomposition
+    mapping field, which is empty for most code points."""
+    if not field:
+        return None, []
+    m = DecompositionRe.match(field)
+    return m.group(1), [int(x, 16) for x in m.group(2).split(' ')]
 
 #------------------------------------------------------------------------------
 # generateTable
@@ -180,44 +234,40 @@ def generateTable(name, type, defval, out, values, blockSize=None):
 """.format(bound, read.format(slot)))
 
 #------------------------------------------------------------------------------
+# generateRecordTable
+#------------------------------------------------------------------------------
+
+def generateRecordTable(name, type, out, fields, blockSize=None):
+    """Emit a struct-valued table as one trie per field.
+
+    `fields` is [(fieldName, fieldType, defaultValue, values)] in declaration
+    order. Each field gets its own table inside the namespace, and get_value()
+    puts the struct back together.
+
+    A field is stored once and reached only through its own table, so a caller
+    that wants one field links one table. That is not a size micro-decision:
+    NormalizationProperties holds pointers into the decomposition data, so a
+    single table of whole structs makes every decomposition string in the
+    database reachable from combining_class(), which wants an integer. Storing
+    the struct whole would also keep two copies of any field a caller reads
+    directly, which is a thing that can drift; here there is one copy.
+    """
+    out.write('namespace {} {{\n'.format(name))
+    for fieldName, fieldType, defval, values in fields:
+        generateTable(fieldName, fieldType, defval, out, values, blockSize)
+    out.write('inline {0} get_value(char32_t cp) {{\n'.format(type))
+    out.write('  return {{{}}};\n}}\n}}\n'.format(
+        ', '.join('{}::get_value(cp)'.format(f[0]) for f in fields)))
+
+#------------------------------------------------------------------------------
 # genGeneralCategoryPropertyTable
 #------------------------------------------------------------------------------
 
 def genGeneralCategoryPropertyTable(ucd):
-    fin = open(ucd + '/UnicodeData.txt')
-
     defval = 'Cn'
-    data = [x.rstrip().split(';') for x in fin]
-
-    def items():
-        codePointPrev = -1
-        i = 0
-        while i < len(data):
-            flds = data[i]
-            codePoint = int(flds[0], 16)
-            value = flds[2]
-
-            for cp in range(codePointPrev + 1, codePoint):
-                yield cp, defval
-
-            if flds[1].endswith('First>'):
-                fldsLast = data[i + 1]
-                codePointLast = int(fldsLast[0], 16)
-                categoryLast = fldsLast[2]
-                for cp in range(codePoint, codePointLast + 1):
-                    yield cp, categoryLast
-                codePointPrev = codePointLast
-                i += 2
-            else:
-                yield codePoint, value
-                codePointPrev = codePoint
-                i += 1
-
-        for cp in range(codePointPrev + 1, MaxCopePoint + 1):
-            yield cp, defval
-
-    values = [val for cp, val in items()]
-    generateTable('_general_category_properties', 'GeneralCategory', defval, sys.stdout, values)
+    values = list(unicodeDataValues(ucd, defval, lambda flds: flds[2]))
+    generateTable('_general_category_properties', 'GeneralCategory', defval,
+                  sys.stdout, values)
 
 #------------------------------------------------------------------------------
 # genPropertyTable
@@ -364,37 +414,17 @@ def genDerivedCorePropertyTable(ucd):
 #------------------------------------------------------------------------------
 
 def genSimpleCaseMappingTable(ucd):
-    fin = open(ucd + '/UnicodeData.txt')
-
-    data = [x.rstrip().split(';') for x in fin]
-    r = re.compile(r"(?:<(\w+)> )?(.+)")
-
     def items():
-        codePointPrev = -1
-        i = 0
-        while i < len(data):
-            flds = data[i]
-            codePoint = int(flds[0], 16)
-            upper = flds[12]
-            lower = flds[13]
-            title = flds[14]
-
-            if flds[1].endswith('First>'):
-                fldsLast = data[i + 1]
-                codePointLast = int(fldsLast[0], 16)
-                codePointPrev = codePointLast
-                i += 2
-            else:
-                if len(upper) or len(lower) or len(title):
-                    if len(upper) == 0:
-                        upper = flds[0]
-                    if len(lower) == 0:
-                        lower = flds[0]
-                    if len(title) == 0:
-                        title = flds[0]
-                    yield codePoint, int(upper, 16), int(lower, 16), int(title, 16)
-                codePointPrev = codePoint
-                i += 1
+        # An absent mapping is the code point itself, but only for a code
+        # point that has at least one of the three.
+        for first, last, flds in unicodeDataRuns(ucd):
+            upper, lower, title = flds[12], flds[13], flds[14]
+            if upper or lower or title:
+                for cp in range(first, last + 1):
+                    yield (cp,
+                           int(upper, 16) if upper else cp,
+                           int(lower, 16) if lower else cp,
+                           int(title, 16) if title else cp)
 
     # Row 0 is the "no mapping" sentinel, so indices stored in the block table
     # below are 1-based and 0 means "this code point has no simple case mapping".
@@ -837,86 +867,41 @@ def genScriptExtensionTable(ucd):
 #------------------------------------------------------------------------------
 
 def genNomalizationPropertyTable(ucd):
-    fin = open(ucd + '/UnicodeData.txt')
+    def extract(flds):
+        compat, codes = parseDecomposition(flds[5])
+        return (int(flds[3]),
+                '"%s"' % compat if compat else '0',
+                to_unicode_literal(codes))
 
-    data = [x.rstrip().split(';') for x in fin]
-    r = re.compile(r"(?:<(\w+)> )?(.+)")
+    classes = []
+    compats = []
+    decompositions = []
+    for cls, compat, codes in unicodeDataValues(ucd, (0, '0', '0'), extract):
+        classes.append(cls)
+        compats.append(compat)
+        decompositions.append(codes)
 
-    def items():
-        codePointPrev = -1
-        i = 0
-        while i < len(data):
-            flds = data[i]
-            codePoint = int(flds[0], 16)
-            combiningClass = int(flds[3])
-            codes = flds[5]
-
-            for cp in range(codePointPrev + 1, codePoint):
-                yield cp, combiningClass, None, []
-
-            if flds[1].endswith('First>'):
-                fldsLast = data[i + 1]
-                codePointLast = int(fldsLast[0], 16)
-                for cp in range(codePoint, codePointLast + 1):
-                    yield cp, combiningClass, None, []
-                codePointPrev = codePointLast
-                i += 2
-            else:
-                m = r.match(codes)
-                if m:
-                    compat = m.group(1)
-                    codes = [int(x, 16) for x in m.group(2).split(' ')]
-                    yield codePoint, combiningClass, compat, codes
-                else:
-                    yield codePoint, combiningClass, None, []
-                codePointPrev = codePoint
-                i += 1
-
-        for cp in range(codePointPrev + 1, MaxCopePoint + 1):
-            yield cp, combiningClass, None, []
-
-    values = []
-    for cp, cls, compat, codes in items():
-        compat = '"%s"' % compat if compat else '0'
-        values.append("{{{},{},{}}}".format(cls, compat, to_unicode_literal(codes)))
-
-    generateTable('_normalization_properties', 'NormalizationProperties',
-                  "{0,0,0}", sys.stdout, values)
+    generateRecordTable('_normalization_properties', 'NormalizationProperties',
+                        sys.stdout,
+                        [('combining_class', 'uint8_t', 0, classes),
+                         ('compat_format', 'const char *', 0, compats),
+                         ('codes', 'const char32_t *', 0, decompositions)])
 
 #------------------------------------------------------------------------------
 # genNomalizationCompositionTable
 #------------------------------------------------------------------------------
 
 def genNomalizationCompositionTable(ucd):
-    fin = open(ucd + '/UnicodeData.txt')
     finExclusions = open(ucd + '/CompositionExclusions.txt')
 
-    data = [x.rstrip().split(';') for x in fin]
-    r = re.compile(r"(?:<(\w+)> )?(.+)")
-
     def items():
-        codePointPrev = -1
-        i = 0
-        while i < len(data):
-            flds = data[i]
-            codePoint = int(flds[0], 16)
-            combiningClass = int(flds[3])
-            codes = flds[5]
-
-            if flds[1].endswith('First>'):
-                fldsLast = data[i + 1]
-                codePointLast = int(fldsLast[0], 16)
-                codePointPrev = codePointLast
-                i += 2
-            else:
-                m = r.match(codes)
-                if m:
-                    compat = m.group(1)
-                    codes = [int(x, 16) for x in m.group(2).split(' ')]
-                    if len(codes) == 2 and not compat and combiningClass == 0:
-                        yield codePoint, codes
-                codePointPrev = codePoint
-                i += 1
+        # A pair composes only from a canonical two-code-point decomposition
+        # of a starter.
+        for first, last, flds in unicodeDataRuns(ucd):
+            compat, codes = parseDecomposition(flds[5])
+            if len(codes) == 2 and not compat and int(flds[3]) == 0:
+                for cp in range(first, last + 1):
+                    yield cp, codes
 
     exclusions = set()
     rRange = re.compile(r"(?:# )?([0-9A-F]{4,})(?:\.\.([0-9A-F]+))?.*")
